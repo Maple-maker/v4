@@ -1,272 +1,319 @@
-import os, tempfile, re
+import io
+import os
+import re
+import tempfile
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
+
 from flask import Flask, request, send_file, render_template_string
 
+import pdfplumber
 from pypdf import PdfReader, PdfWriter
-from pypdf._page import PageObject
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
-from reportlab.lib.units import inch
-
-VERSION = "2025-12-31.flask.v4"
-
-HTML = """
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>BOM → DD1750</title>
-  <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;max-width:980px;margin:40px auto;padding:0 16px}
-    .box{border:1px solid #ddd;border-radius:10px;padding:18px;margin:16px 0}
-    label{display:block;margin:10px 0 4px}
-    input,select{padding:8px;width:100%}
-    button{padding:10px 14px;border:0;border-radius:8px;background:#111;color:#fff;cursor:pointer}
-    small{color:#555}
-    .row{display:flex;gap:18px}
-    .col{flex:1}
-  </style>
-</head>
-<body>
-  <h2>BOM → DD1750</h2>
-  <p><small>Version: {{version}}</small></p>
-
-  <div class="box">
-    <form method="post" action="/generate" enctype="multipart/form-data">
-      <div class="row">
-        <div class="col">
-          <label>BOM (PDF)</label>
-          <input type="file" name="bom" accept=".pdf" required>
-        </div>
-        <div class="col">
-          <label>Blank DD1750 template (PDF)</label>
-          <input type="file" name="template" accept=".pdf" required>
-        </div>
-      </div>
-
-      <div class="row">
-        <div class="col">
-          <label>Label under description</label>
-          <select name="label">
-            <option value="NSN" selected>NSN</option>
-            <option value="SN">SN</option>
-          </select>
-        </div>
-        <div class="col">
-          <label>Start parsing BOM at page (0-based)</label>
-          <input type="number" name="start_page" value="0" min="0">
-        </div>
-      </div>
-
-      <p><small>Uses PDF text extraction. If your BOM is scanned, OCR it (Adobe “Recognize Text”) before upload.</small></p>
-
-      <button type="submit">Generate DD1750</button>
-    </form>
-  </div>
-</body>
-</html>
-"""
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.lib.utils import simpleSplit
 
 app = Flask(__name__)
 
-# ---------- BOM parsing (BOM tables like your B49 style) ----------
+# -----------------------------
+# Parsing helpers
+# -----------------------------
 
-LV_RE = re.compile(r"^\s*([A-Z])\s*$")
-MAT_RE = re.compile(r"^\s*(\d{7,12})\s*$")  # material/NSN numbers are digits
-QTY_RE = re.compile(r"(\d+)\s*$")
+@dataclass
+class ItemRow:
+    description: str
+    nsn: str
+    qty: int
 
-def looks_like_qty_line(s: str) -> bool:
-    u = s.upper()
-    # Lines that commonly contain the OH QTY at end include UI/SCMC fields like "X U EA 9G 1"
-    return any(tok in u for tok in [" X ", " U ", " EA ", " AY ", "9G", "9K", "SCMC", "CIIC"])
+def _clean_nsn(token: str) -> str:
+    # Keep only digits; preserve leading zeros
+    d = re.sub(r"[^0-9]", "", token or "")
+    return d
 
-def is_header_noise(s: str) -> bool:
-    u = s.upper()
-    return any(h in u for h in [
-        "LV", "DESCRIPTION", "WTY", "ARC", "CIIC", "UI", "SCMC", "AUTH", "OH QTY",
-        "COMPONENT OF END ITEM", "PAGE", "COEI"
-    ])
+def _as_int(token: str) -> Optional[int]:
+    token = (token or "").strip()
+    if not token:
+        return None
+    # If OCR introduces commas or stray chars, strip.
+    token = re.sub(r"[^0-9\-]", "", token)
+    if not token:
+        return None
+    try:
+        return int(token)
+    except Exception:
+        return None
 
-def normalize_desc(s: str) -> str:
-    s = re.sub(r"\s{2,}", " ", s).strip()
-    # keep only the real description text, strip trailing column junk if present
-    return s[:90]
+def parse_bom_pdf(bom_bytes: bytes, start_page: int = 0) -> List[ItemRow]:
+    """
+    Extract rows from a BOM PDF that looks like:
+      LV | Description | ... | OH Qty
+    We ONLY use:
+      - item nomenclature from Description column
+      - material/NSN from the left-side material number inside the description block (often appears as digits)
+      - OH QTY as qty
+    Strategy:
+      1) Use pdfplumber to pull tables where possible.
+      2) Fallback to text-line parsing and a regex that matches a description block + OH qty.
+    """
+    rows: List[ItemRow] = []
+    with pdfplumber.open(io.BytesIO(bom_bytes)) as pdf:
+        for pno in range(start_page, len(pdf.pages)):
+            page = pdf.pages[pno]
+            # Try table extraction first (works for many BOMs)
+            try:
+                tables = page.extract_tables()
+            except Exception:
+                tables = []
+            for table in tables or []:
+                if not table or len(table) < 2:
+                    continue
+                # Find header indexes
+                header = [str(c or "").strip().upper() for c in table[0]]
+                def idx_of(name_opts):
+                    for opt in name_opts:
+                        for i, h in enumerate(header):
+                            if opt in h:
+                                return i
+                    return None
+                idx_desc = idx_of(["DESCRIPTION"])
+                idx_oh = idx_of(["OH QTY", "OHQTY", "ON HAND", "ON-HAND", "OH  QTY"])
+                idx_mat = idx_of(["MATERIAL", "NSN", "MAT"])
+                # Some BOMs embed material in description; allow idx_mat None.
+                if idx_desc is None or idx_oh is None:
+                    continue
+                for r in table[1:]:
+                    if not r:
+                        continue
+                    desc = str(r[idx_desc] or "").strip()
+                    if not desc:
+                        continue
+                    oh = _as_int(str(r[idx_oh] or ""))
+                    if oh is None or oh == 0:
+                        continue
+                    mat = _clean_nsn(str(r[idx_mat] or "")) if idx_mat is not None else ""
+                    # If material empty, attempt to find a 9-10 digit NSN-like number in desc
+                    if not mat:
+                        m = re.search(r"\b(\d{9,10})\b", desc.replace(" ", ""))
+                        if m:
+                            mat = m.group(1)
+                    # Clean description (drop excessive whitespace/newlines)
+                    desc = re.sub(r"\s+", " ", desc).strip()
+                    if mat and desc:
+                        rows.append(ItemRow(description=desc, nsn=mat, qty=int(oh)))
 
-def extract_items_bom_style(pdf_path: str, start_page: int = 0):
-    reader = PdfReader(pdf_path)
-    items = []
-    cur = {"desc": None, "mat": None, "qty": None}
-
-    def flush():
-        nonlocal cur
-        if cur["desc"] and cur["mat"] and cur["qty"] is not None and cur["qty"] > 0:
-            items.append({"desc": cur["desc"], "mat": cur["mat"], "qty": cur["qty"]})
-        cur = {"desc": None, "mat": None, "qty": None}
-
-    for pi in range(start_page, len(reader.pages)):
-        txt = reader.pages[pi].extract_text() or ""
-        if not txt.strip():
-            continue
-        lines = [l.rstrip() for l in txt.splitlines() if l.strip()]
-        for raw in lines:
-            s = raw.strip()
-            if not s or is_header_noise(s):
+            # Fallback: parse text lines using a state machine.
+            txt = page.extract_text() or ""
+            if not txt.strip():
+                continue
+            lines = [re.sub(r"\s+", " ", l).strip() for l in txt.splitlines() if l.strip()]
+            # Detect if this looks like a BOM content page (has "LV" and "OH Qty")
+            if not any("OH" in l.upper() and "QTY" in l.upper() for l in lines):
                 continue
 
-            # Start of a new LV block
-            if LV_RE.match(s):
-                flush()
-                continue
+            # Heuristic: in many PDFs, description appears on a line by itself and qty is a trailing token.
+            # We'll look for lines that end with an integer and have letters in front.
+            for l in lines:
+                # Skip obvious headers/footers
+                UL = l.upper()
+                if UL.startswith("LV ") or "DESCRIPTION" in UL or "WTY" in UL or "ARC" in UL or "CIIC" in UL:
+                    continue
+                # Try match "... <qty>" at end
+                m = re.match(r"^(.*\D)\s+(\d{1,6})$", l)
+                if not m:
+                    continue
+                left, qty_s = m.group(1).strip(), m.group(2)
+                qty = int(qty_s)
+                if qty == 0:
+                    continue
+                # left may include an LV at start like "B BASE ASSEMBLY, OUTRIGGER"
+                left = re.sub(r"^[A-Z]\s+", "", left)
+                # Extract likely NSN/material from left (first 9-10 digit run)
+                nsn = ""
+                m2 = re.search(r"\b(\d{9,10})\b", left.replace(" ", ""))
+                if m2:
+                    nsn = m2.group(1)
+                    # Remove that numeric run from description
+                    left = re.sub(m2.group(1), "", left)
+                desc = re.sub(r"\s+", " ", left).strip(" -:")
+                if desc and nsn:
+                    rows.append(ItemRow(description=desc, nsn=nsn, qty=qty))
 
-            # Material number (digits only line)
-            mm = MAT_RE.match(s)
-            if mm:
-                cur["mat"] = mm.group(1)
-                continue
+    # Deduplicate: keep max qty for same (desc, nsn)
+    dedup = {}
+    for r in rows:
+        key = (r.description.upper(), r.nsn)
+        if key not in dedup or r.qty > dedup[key].qty:
+            dedup[key] = r
+    return list(dedup.values())
 
-            # Qty: often at end of "X U EA ... <qty>" line
-            if looks_like_qty_line(" " + s + " "):
-                qm = QTY_RE.search(s)
-                if qm:
-                    qty = int(qm.group(1))
-                    # hard guardrail: ignore insane OCR-style quantities
-                    if 0 <= qty <= 999:
-                        cur["qty"] = qty
-                continue
+# -----------------------------
+# Rendering helpers
+# -----------------------------
 
-            # Description line: first meaningful non-header, non-mat, non-qty line
-            if cur["desc"] is None:
-                # avoid grabbing lone codes
-                if len(s) >= 3 and not MAT_RE.match(s):
-                    cur["desc"] = normalize_desc(s)
-                continue
+def _wrap_desc(desc: str, max_width: float, font_name: str, font_size: int, max_lines: int = 2) -> List[str]:
+    lines = simpleSplit(desc, font_name, font_size, max_width)
+    if len(lines) <= max_lines:
+        return lines
+    # truncate last line with ellipsis
+    kept = lines[:max_lines]
+    if len(kept[-1]) > 3:
+        kept[-1] = kept[-1][: max(0, len(kept[-1]) - 3)] + "..."
+    return kept
 
-            # Some descriptions wrap; if second line looks like continuation and we have space, append
-            if cur["desc"] and cur["mat"] is None and len(cur["desc"]) < 80 and len(s) < 40 and not looks_like_qty_line(" "+s+" "):
-                cur["desc"] = normalize_desc(cur["desc"] + " " + s)
+def build_overlay(items: List[ItemRow], page_size=letter) -> bytes:
+    """
+    Draw ONLY the list area:
+      Box no, Description+NSN, UOI=EA, Initial=qty, Spares=0, Total=qty
+    """
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=page_size)
 
-    flush()
-    # Remove duplicates that happen from repeated headers/page breaks
-    dedup = []
-    seen = set()
-    for it in items:
-        key = (it["desc"], it["mat"], it["qty"])
-        if key in seen:
-            continue
-        seen.add(key)
-        dedup.append(it)
-    return dedup
+    # Layout (tuned to "blank_flat" 1750 template; adjust as needed)
+    # X centers for columns:
+    X_BOX = 85
+    X_DESC_L = 125
+    DESC_W = 285
+    X_UOI = 430
+    X_INIT = 485
+    X_SPARES = 535
+    X_TOTAL = 585
 
-def paginate(items, per_page=18):
-    return [items[i:i+per_page] for i in range(0, len(items), per_page)] or [[]]
+    # Vertical layout
+    Y_TOP = 525   # start higher to remove top gap
+    Y_BOTTOM = 95  # stop above signature block
+    ROW_H = 24     # row height so we can fill page without huge gaps
 
-# ---------- DD1750 overlay (align to template columns) ----------
+    FONT = "Helvetica"
+    c.setFont(FONT, 9)
 
-def make_overlay(pages, label="NSN"):
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    c = canvas.Canvas(tmp.name, pagesize=letter)
-
-    # Column centers (tuned to "blank_flat.pdf" style)
-    x_box_center = 1.10*inch
-    x_contents_left = 1.62*inch
-
-    # Move UNIT OF ISSUE column LEFT vs earlier builds (user feedback)
-    x_uoi_center = 6.18*inch
-
-    # Quantity columns
-    x_init_center = 7.05*inch
-    x_spares_center = 7.83*inch
-    x_total_center = 8.58*inch
-
-    top = 6.55*inch     # start at first writable row (fix "starts halfway down")
-    bottom = 1.06*inch
-    per_page = 18
-    row_h = (top-bottom)/per_page
-
-    for p, rows in enumerate(pages, start=1):
-        y = top - row_h/2.0
-        for idx, it in enumerate(rows, start=1):
-            line_no = (p-1)*per_page + idx
+    idx = 0
+    while idx < len(items):
+        y = Y_TOP
+        # per-page loop
+        while idx < len(items) and (y - ROW_H) >= Y_BOTTOM:
+            row_num = idx + 1
+            it = items[idx]
 
             # Box number centered
-            c.setFont("Helvetica", 9)
-            s = str(line_no)
-            c.drawString(x_box_center - c.stringWidth(s,"Helvetica",9)/2, y-3, s)
+            c.setFont(FONT, 9)
+            c.drawCentredString(X_BOX, y - 15, str(row_num))
 
-            # Contents: description + NSN/SN on next line
-            c.setFont("Helvetica", 9)
-            c.drawString(x_contents_left, y+2, it["desc"])
-            c.setFont("Helvetica", 8)
-            c.drawString(x_contents_left, y-10, f"{label}: {it['mat']}")
+            # Description wrapped
+            desc_lines = _wrap_desc(it.description.upper(), DESC_W, FONT, 10, max_lines=2)
+            c.setFont(FONT, 10)
+            c.drawString(X_DESC_L, y - 10, desc_lines[0])
+            if len(desc_lines) > 1:
+                c.drawString(X_DESC_L, y - 21, desc_lines[1])
 
-            # Unit of issue fixed EA, centered in its column
-            c.setFont("Helvetica", 9)
-            unit = "EA"
-            c.drawString(x_uoi_center - c.stringWidth(unit,"Helvetica",9)/2, y-3, unit)
+            # NSN line under description (always numeric)
+            c.setFont(FONT, 9)
+            c.drawString(X_DESC_L, y - 33, f"NSN: {it.nsn}")
 
-            # Initial operation (d) = qty; Running spares always 0; Total = qty
-            q = str(it["qty"])
-            c.drawString(x_init_center - c.stringWidth(q,"Helvetica",9)/2, y-3, q)
+            # UOI, quantities
+            c.setFont(FONT, 10)
+            c.drawCentredString(X_UOI, y - 15, "EA")
+            c.drawCentredString(X_INIT, y - 15, str(it.qty))
+            c.drawCentredString(X_SPARES, y - 15, "0")
+            c.drawCentredString(X_TOTAL, y - 15, str(it.qty))
 
-            z = "0"
-            c.drawString(x_spares_center - c.stringWidth(z,"Helvetica",9)/2, y-3, z)
-
-            c.drawString(x_total_center - c.stringWidth(q,"Helvetica",9)/2, y-3, q)
-
-            y -= row_h
+            y -= ROW_H
+            idx += 1
 
         c.showPage()
 
     c.save()
-    return tmp.name
+    return buf.getvalue()
 
-def merge_with_template(template_pdf: str, overlay_pdf: str, out_pdf: str):
-    tpl = PdfReader(template_pdf)
-    ov = PdfReader(overlay_pdf)
-    writer = PdfWriter()
+def merge_overlay_on_template(template_bytes: bytes, overlay_pdf_bytes: bytes) -> bytes:
+    tpl = PdfReader(io.BytesIO(template_bytes))
+    ov = PdfReader(io.BytesIO(overlay_pdf_bytes))
+    out = PdfWriter()
+
+    # Repeat template first page for each overlay page
     base = tpl.pages[0]
+    for p in ov.pages:
+        newp = base
+        # Need copy to avoid mutating base repeatedly
+        newp = newp.copy()
+        newp.merge_page(p)
+        out.add_page(newp)
 
-    for ovp in ov.pages:
-        merged = PageObject.create_blank_page(width=base.mediabox.width, height=base.mediabox.height)
-        merged.merge_page(base)
-        merged.merge_page(ovp)
-        writer.add_page(merged)
+    out_buf = io.BytesIO()
+    out.write(out_buf)
+    return out_buf.getvalue()
 
-    with open(out_pdf, "wb") as f:
-        writer.write(f)
+# -----------------------------
+# Minimal UI
+# -----------------------------
 
-@app.get("/")
-def home():
-    return render_template_string(HTML, version=VERSION)
+HTML = """
+<!doctype html>
+<title>BOM → DD1750</title>
+<style>
+body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; }
+.row { display:flex; gap:24px; }
+.col { flex:1; }
+label { font-weight:600; display:block; margin-top:12px; }
+input[type=file] { width: 100%; }
+input[type=number] { width: 120px; }
+button { margin-top: 16px; padding: 10px 14px; font-weight:600; }
+small { color:#555; }
+</style>
+<h2>BOM → DD1750 (Flask v4 patched)</h2>
+<form method="post" enctype="multipart/form-data">
+<div class="row">
+  <div class="col">
+    <label>BOM (PDF)</label>
+    <input name="bom" type="file" accept=".pdf" required>
+    <label>Start parsing at page (0-based)</label>
+    <input name="start_page" type="number" value="0" min="0">
+    <small>Use 0 for normal BOMs.</small>
+  </div>
+  <div class="col">
+    <label>DD1750 template (flat PDF)</label>
+    <input name="template" type="file" accept=".pdf" required>
+    <small>Upload your blank_flat.pdf template.</small>
+  </div>
+</div>
+<button type="submit">Generate DD1750</button>
+</form>
+{% if error %}
+<p style="color:#b00020; font-weight:600;">{{ error }}</p>
+{% endif %}
+"""
 
-@app.post("/generate")
-def generate():
-    if "bom" not in request.files or "template" not in request.files:
-        return "Missing files", 400
+@app.route("/", methods=["GET", "POST"])
+def index():
+    if request.method == "GET":
+        return render_template_string(HTML, error=None)
 
-    bom = request.files["bom"]
-    template = request.files["template"]
-    label = request.form.get("label", "NSN")
-    start_page = int(request.form.get("start_page", "0") or "0")
+    try:
+        bom = request.files.get("bom")
+        template = request.files.get("template")
+        if not bom or not template:
+            return render_template_string(HTML, error="Please upload both BOM and template.")
+        start_page = int(request.form.get("start_page", "0") or "0")
 
-    with tempfile.TemporaryDirectory() as td:
-        bom_path = os.path.join(td, "bom.pdf")
-        tpl_path = os.path.join(td, "template.pdf")
-        bom.save(bom_path)
-        template.save(tpl_path)
+        bom_bytes = bom.read()
+        tpl_bytes = template.read()
 
-        items = extract_items_bom_style(bom_path, start_page=start_page)
+        items = parse_bom_pdf(bom_bytes, start_page=start_page)
+        if not items:
+            return render_template_string(HTML, error="No items parsed from BOM. If this BOM is scanned, convert to a text PDF or provide an Excel export.")
 
-        # drop qty=0 (per your rule)
-        items = [it for it in items if int(it["qty"]) > 0]
+        overlay = build_overlay(items)
+        merged = merge_overlay_on_template(tpl_bytes, overlay)
 
-        pages = paginate(items, per_page=18)
-        overlay = make_overlay(pages, label=label)
-
-        out_pdf = os.path.join(td, "DD1750_OUTPUT.pdf")
-        merge_with_template(tpl_path, overlay, out_pdf)
-
-        return send_file(out_pdf, as_attachment=True, download_name="DD1750_OUTPUT.pdf", mimetype="application/pdf")
+        return send_file(
+            io.BytesIO(merged),
+            mimetype="application/pdf",
+            as_attachment=True,
+            download_name="DD1750.pdf",
+        )
+    except Exception as e:
+        return render_template_string(HTML, error=f"error: {e}")
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
